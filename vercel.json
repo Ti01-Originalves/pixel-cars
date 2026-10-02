@@ -1,0 +1,37 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "app": {
+      "root": ".",
+      "framework": "vite"
+    },
+    "vite": {
+      "root": "node_module/@tailwindcss/vite",
+      "framework": "vite"
+    },
+    "lightningcss": {
+      "root": "node_module/lightningcss",
+      "framework": "parcel"
+    },
+    "lucide-react": {
+      "root": "node_module/lucide-react",
+      "framework": "vite"
+    },
+    "react-dom": {
+      "root": "node_module/react-dom",
+      "runtime": "node"
+    },
+    "rollup": {
+      "root": "node_module/rollup",
+      "framework": "vite"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "app"
+      }
+    }
+  ]
+}
