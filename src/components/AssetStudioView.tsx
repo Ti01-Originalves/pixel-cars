@@ -1856,6 +1856,274 @@ export const AssetStudioView: React.FC<AssetStudioViewProps> = ({
     setTimeout(() => setSavedSuccess(false), 2500);
   };
 
+  // Import Image Handler (client-side processing)
+  const handleImportImage = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        processImportedImage(img, file.name);
+      };
+      img.src = event.target?.result as string;
+    };
+    reader.readAsDataURL(file);
+    // Reset input to allow re-importing same file
+    e.target.value = '';
+  }, [onSaveAsset]);
+
+  // Client-side image processing (simplified version of server script)
+  const processImportedImage = async (img: HTMLImageElement, fileName: string) => {
+    try {
+      // Create canvas for processing
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const SIDE_W = 48, SIDE_H = 24;
+      const FRONT_W = 24, FRONT_H = 24;
+      const TOP_W = 48, TOP_H = 24;
+
+      // Resize to side view dimensions
+      canvas.width = SIDE_W;
+      canvas.height = SIDE_H;
+      ctx.drawImage(img, 0, 0, SIDE_W, SIDE_H);
+
+      const imageData = ctx.getImageData(0, 0, SIDE_W, SIDE_H);
+      const data = imageData.data;
+
+      // Extract dominant colors (simplified)
+      const colorCounts: Record<string, number> = {};
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+        if (a < 128) continue;
+        const hex = '#' + [r, g, b].map(c => Math.round(c/32)*32.toString(16).padStart(2,'0')).join('');
+        colorCounts[hex] = (colorCounts[hex] || 0) + 1;
+      }
+
+      const sortedColors = Object.entries(colorCounts).sort((a,b) => b[1]-a[1]).map(([c]) => c);
+      const bodyColors = sortedColors.filter(c => {
+        const l = parseInt(c.slice(1),16);
+        const r = (l>>16)&255, g = (l>>8)&255, b = l&255;
+        const lum = 0.299*r + 0.587*g + 0.114*b;
+        return lum > 30 && lum < 220;
+      });
+
+      const primary = bodyColors[0] || '#e11d48';
+      const secondary = bodyColors[1] || '#09090b';
+
+      // Generate 5-tone palette
+      const pr = parseInt(primary.slice(1,3),16), pg = parseInt(primary.slice(3,5),16), pb = parseInt(primary.slice(5,7),16);
+      const adjust = (r:number,g:number,b:number,f:number) => '#'+[r,g,b].map(c=>Math.min(255,Math.max(0,Math.round(c*f))).toString(16).padStart(2,'0')).join('');
+
+      const tokens = {
+        primary,
+        primaryHi: adjust(pr,pg,pb,1.5),
+        primaryLight: adjust(pr,pg,pb,1.25),
+        primaryDark: adjust(pr,pg,pb,0.7),
+        primaryDeep: adjust(pr,pg,pb,0.45),
+        secondary,
+        glass: '#0f172a',
+        glassSky: '#38bdf8',
+        glassGlare: '#e0f2fe',
+        lamp: '#fef08a',
+        tail: '#ef4444',
+        dark: '#09090b',
+        tire: '#18181b',
+        chrome: '#e2e8f0'
+      };
+
+      // Build right view grid with token mapping
+      const pixelsRight: string[] = new Array(SIDE_W * SIDE_H).fill('');
+      for (let y = 0; y < SIDE_H; y++) {
+        for (let x = 0; x < SIDE_W; x++) {
+          const i = (y * SIDE_W + x) * 4;
+          const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+          if (a < 128) { pixelsRight[y * SIDE_W + x] = 'transparent'; continue; }
+          const hex = '#' + [r,g,b].map(c => Math.round(c/32)*32.toString(16).padStart(2,'0')).join('');
+
+          // Map to nearest token
+          const tokenColors: Record<string, [number,number,number]> = {
+            '__PRIMARY_HI__': [parseInt(tokens.primaryHi.slice(1,3),16), parseInt(tokens.primaryHi.slice(3,5),16), parseInt(tokens.primaryHi.slice(5,7),16)],
+            '__PRIMARY_LIGHT__': [parseInt(tokens.primaryLight.slice(1,3),16), parseInt(tokens.primaryLight.slice(3,5),16), parseInt(tokens.primaryLight.slice(5,7),16)],
+            '__PRIMARY_BASE__': [pr, pg, pb],
+            '__PRIMARY_DARK__': [parseInt(tokens.primaryDark.slice(1,3),16), parseInt(tokens.primaryDark.slice(3,5),16), parseInt(tokens.primaryDark.slice(5,7),16)],
+            '__PRIMARY_DEEP__': [parseInt(tokens.primaryDeep.slice(1,3),16), parseInt(tokens.primaryDeep.slice(3,5),16), parseInt(tokens.primaryDeep.slice(5,7),16)],
+            '__SECONDARY_BASE__': [parseInt(secondary.slice(1,3),16), parseInt(secondary.slice(3,5),16), parseInt(secondary.slice(5,7),16)],
+            '#0f172a': [15,23,42], '#38bdf8': [56,189,248], '#e0f2fe': [224,242,254],
+            '#fef08a': [254,240,138], '#ef4444': [239,68,68], '#09090b': [9,9,11],
+            '#18181b': [24,24,27], '#e2e8f0': [226,232,240]
+          };
+
+          let bestToken = '__PRIMARY_BASE__', bestDist = Infinity;
+          for (const [token, [tr,tg,tb]] of Object.entries(tokenColors)) {
+            const dist = Math.abs(r-tr) + Math.abs(g-tg) + Math.abs(b-tb);
+            if (dist < bestDist) { bestDist = dist; bestToken = token; }
+          }
+          pixelsRight[y * SIDE_W + x] = bestDist > 100 ? hex : bestToken;
+        }
+      }
+
+      // Generate other views
+      const mirrorGrid = (pixels: string[], w: number, h: number) => {
+        const r = new Array(w*h).fill('');
+        for (let y=0;y<h;y++) for (let x=0;x<w;x++) r[y*w+(w-1-x)] = pixels[y*w+x];
+        return r;
+      };
+
+      const pixelsLeft = mirrorGrid(pixelsRight, SIDE_W, SIDE_H);
+
+      const genFront = () => {
+        const p = new Array(FRONT_W*FRONT_H).fill('');
+        const fill = (p:string[], w:number, h:number, rx:number, ry:number, rw:number, rh:number, c:string) => {
+          for (let y=Math.max(0,ry);y<Math.min(h,ry+rh);y++) for (let x=Math.max(0,rx);x<Math.min(w,rx+rw);x++) p[y*w+x]=c;
+        };
+        fill(p,FRONT_W,FRONT_H,3,17,18,2,tokens.secondary);
+        fill(p,FRONT_W,FRONT_H,4,14,16,3,tokens.primary);
+        fill(p,FRONT_W,FRONT_H,8,15,8,2,tokens.dark);
+        fill(p,FRONT_W,FRONT_H,4,13,3,2,tokens.lamp);
+        fill(p,FRONT_W,FRONT_H,17,13,3,2,tokens.lamp);
+        fill(p,FRONT_W,FRONT_H,11,14,2,2,tokens.secondary);
+        fill(p,FRONT_W,FRONT_H,6,9,12,5,tokens.glass);
+        fill(p,FRONT_W,FRONT_H,8,10,3,3,tokens.glassSky);
+        fill(p,FRONT_W,FRONT_H,7,8,10,1,tokens.primary);
+        fill(p,FRONT_W,FRONT_H,2,16,2,3,tokens.tire);
+        fill(p,FRONT_W,FRONT_H,20,16,2,3,tokens.tire);
+        return p;
+      };
+
+      const genRear = () => {
+        const p = new Array(FRONT_W*FRONT_H).fill('');
+        const fill = (p:string[], w:number, h:number, rx:number, ry:number, rw:number, rh:number, c:string) => {
+          for (let y=Math.max(0,ry);y<Math.min(h,ry+rh);y++) for (let x=Math.max(0,rx);x<Math.min(w,rx+rw);x++) p[y*w+x]=c;
+        };
+        fill(p,FRONT_W,FRONT_H,3,17,18,2,tokens.secondary);
+        fill(p,FRONT_W,FRONT_H,4,14,16,3,tokens.primary);
+        fill(p,FRONT_W,FRONT_H,4,13,4,2,tokens.tail);
+        fill(p,FRONT_W,FRONT_H,16,13,4,2,tokens.tail);
+        fill(p,FRONT_W,FRONT_H,9,14,6,2,tokens.dark);
+        fill(p,FRONT_W,FRONT_H,6,17,2,1,'#94a3b8');
+        fill(p,FRONT_W,FRONT_H,16,17,2,1,'#94a3b8');
+        fill(p,FRONT_W,FRONT_H,6,9,12,5,tokens.glass);
+        fill(p,FRONT_W,FRONT_H,7,8,10,1,tokens.primary);
+        fill(p,FRONT_W,FRONT_H,3,6,18,1,tokens.secondary);
+        fill(p,FRONT_W,FRONT_H,6,7,1,2,tokens.secondary);
+        fill(p,FRONT_W,FRONT_H,17,7,1,2,tokens.secondary);
+        fill(p,FRONT_W,FRONT_H,2,16,2,3,tokens.tire);
+        fill(p,FRONT_W,FRONT_H,20,16,2,3,tokens.tire);
+        return p;
+      };
+
+      const genTop = () => {
+        const p = new Array(TOP_W*TOP_H).fill('');
+        const fill = (p:string[], w:number, h:number, rx:number, ry:number, rw:number, rh:number, c:string) => {
+          for (let y=Math.max(0,ry);y<Math.min(h,ry+rh);y++) for (let x=Math.max(0,rx);x<Math.min(w,rx+rw);x++) p[y*w+x]=c;
+        };
+        fill(p,TOP_W,TOP_H,6,5,36,14,tokens.primary);
+        fill(p,TOP_W,TOP_H,34,10,8,4,tokens.secondary);
+        fill(p,TOP_W,TOP_H,26,6,6,12,tokens.glass);
+        fill(p,TOP_W,TOP_H,18,6,8,12,tokens.primary);
+        fill(p,TOP_W,TOP_H,12,6,6,12,tokens.glass);
+        fill(p,TOP_W,TOP_H,4,4,2,16,tokens.secondary);
+        fill(p,TOP_W,TOP_H,28,3,2,2,tokens.primary);
+        fill(p,TOP_W,TOP_H,28,19,2,2,tokens.primary);
+        fill(p,TOP_W,TOP_H,10,3,6,2,tokens.tire);
+        fill(p,TOP_W,TOP_H,10,19,6,2,tokens.tire);
+        fill(p,TOP_W,TOP_H,32,3,6,2,tokens.tire);
+        fill(p,TOP_W,TOP_H,32,19,6,2,tokens.tire);
+        fill(p,TOP_W,TOP_H,42,7,2,10,tokens.secondary);
+        return p;
+      };
+
+      const pixelsFront = genFront();
+      const pixelsRear = genRear();
+      const pixelsTop = genTop();
+
+      // Generate vector path (simplified)
+      const topPoints: {x:number,y:number}[] = [], bottomPoints: {x:number,y:number}[] = [];
+      let minCol = SIDE_W, maxCol = -1;
+      for (let x=0; x<SIDE_W; x++) {
+        let topY=-1, botY=-1;
+        for (let y=0; y<SIDE_H; y++) {
+          const c = pixelsRight[y*SIDE_W+x];
+          if (c && c!=='transparent' && c!=='') { if (topY===-1) topY=y; botY=y; }
+        }
+        if (topY!==-1) { topPoints.push({x,y:topY}); bottomPoints.push({x,y:botY}); if(x<minCol)minCol=x; if(x>maxCol)maxCol=x; }
+      }
+
+      let vectorPath = 'M 6 18 C 6 15, 9 14, 12 14 L 17 14 C 20 10, 24 8, 30 8 L 34 8 C 38 8, 42 12, 44 14 L 46 16 C 46 18, 44 19, 41 19 C 39 19, 39 17, 36 17 C 33 17, 33 19, 21 19 C 19 19, 19 17, 16 17 C 13 17, 13 19, 8 19 Z';
+      if (topPoints.length >= 4 && minCol < maxCol) {
+        const smoothTop = topPoints.filter((_,i)=>i%2===0);
+        if (smoothTop[smoothTop.length-1]?.x !== topPoints[topPoints.length-1]?.x) smoothTop.push(topPoints[topPoints.length-1]);
+        const smoothBot = bottomPoints.filter((_,i)=>i%2===0).reverse();
+        if (smoothBot[smoothBot.length-1]?.x !== bottomPoints[0]?.x) smoothBot.push(bottomPoints[0]);
+
+        let path = `M ${smoothTop[0].x} ${smoothTop[0].y+1}`;
+        for (let i=1;i<smoothTop.length;i++) {
+          const midX = ((smoothTop[i-1].x+smoothTop[i].x)/2).toFixed(1);
+          path += ` C ${midX} ${smoothTop[i-1].y}, ${midX} ${smoothTop[i].y}, ${smoothTop[i].x} ${smoothTop[i].y}`;
+        }
+        path += ` L ${smoothTop[smoothTop.length-1].x} ${smoothBot[0].y}`;
+        for (let i=1;i<smoothBot.length;i++) path += ` L ${smoothBot[i].x} ${smoothBot[i].y}`;
+        path += ` Z`;
+        vectorPath = path;
+      }
+
+      // Crypto hash (same as server)
+      const cryptoHash = (input: string) => {
+        let h0=0x6a09e667,h1=0xbb67ae85,h2=0x3c6ef372,h3=0xa54ff53a,h4=0x510e527f,h5=0x9b05688c,h6=0x1f83d9ab,h7=0x5be0cd19;
+        for(let i=0;i<input.length;i++){const c=input.charCodeAt(i);h0=(Math.imul(h0^c,0x5bd1e995)+(h1<<5)+(h1>>>2))>>>0;h1=(Math.imul(h1^(c*31),0x1b873593)+(h2<<5)+(h2>>>2))>>>0;h2=(Math.imul(h2^(c*73),0x85ebca6b)+(h3<<5)+(h3>>>2))>>>0;h3=(Math.imul(h3^(c*127),0xc2b2ae35)+(h4<<5)+(h4>>>2))>>>0;h4=(Math.imul(h4^(c*199),0x27d4eb2f)+(h5<<5)+(h5>>>2))>>>0;h5=(Math.imul(h5^(c*251),0x165667b1)+(h6<<5)+(h6>>>2))>>>0;h6=(Math.imul(h6^(c*311),0x9e3779b9)+(h7<<5)+(h7>>>2))>>>0;h7=(Math.imul(h7^(c*397),0x45bf92e1)+(h0<<5)+(h0>>>2))>>>0;}
+        const toHex=(n:number)=>('00000000'+(n>>>0).toString(16)).slice(-8);
+        return (toHex(h0)+toHex(h1)+toHex(h2)+toHex(h3)+toHex(h4)+toHex(h5)+toHex(h6)+toHex(h7)).toUpperCase();
+      };
+
+      const creatorId = 'web-importer-v1';
+      const assetName = fileName.replace(/\.[^.]+$/,'').replace(/[_\-]/g,' ');
+      const timestamp = Date.now();
+      const payload = `${creatorId}::${assetName}::${vectorPath}::${SIDE_W}x${SIDE_H}::${timestamp}::CRYPTO_TOKEN_AUCTION_V2`;
+      const rawHash = cryptoHash(payload);
+      const encryptedHashId = `CIPHER-SHA256-${rawHash.slice(0,24)}`;
+      const creatorPrefix = creatorId.replace(/[^a-zA-Z0-9]/g,'').slice(0,8);
+      const creatorSignature = `SIG-ECDSA-v2.${rawHash.slice(24,48)}.${creatorPrefix}`;
+      const pointCount = (vectorPath.match(/[MLCQZ]/g)||[]).length;
+      const rawScore = Math.min(99,Math.max(45,Math.floor(pointCount*3.2+vectorPath.length*0.12)));
+      const auctionEstimate = Math.floor(rawScore*280+3500);
+
+      const asset = {
+        id: `custom_${timestamp}_${Math.random().toString(36).slice(2,8)}`,
+        name: assetName,
+        createdAt: timestamp,
+        width: SIDE_W, height: SIDE_H,
+        pixels: pixelsRight, pixelsLeft, pixelsFront, pixelsRear, pixelsTop,
+        basePrimaryColorToken: '__PRIMARY_BASE__', baseSecondaryColorToken: '__SECONDARY_BASE__',
+        accessoryConfig: {
+          wheels: {visible:true, rearX:10, rearY:17, frontX:38, frontY:17, radius:3.5, layer:'in_front' as const, style:'spokes' as const, spinning:true, color:'#18181b'},
+          spoiler: {visible:true, x:4, y:7, scale:1, layer:'in_front' as const, style:'gt_wing' as const, color:'#09090b'},
+          nitro: {visible:true, x:1, y:17, layer:'behind' as const},
+          headlights: {visible:true, x:42, y:14, beamVisible:true, layer:'in_front' as const},
+          neon: {visible:false, color:'#00f0ff', y:20}
+        },
+        vectorPath,
+        encryptedHashId, creatorId, creatorSignature,
+        rarityScore: rawScore, primaryColor: primary, secondaryColor: secondary, neonColor: '#00f0ff',
+        presetBase: 'imported', isAuctionReady: true, auctionEstimate
+      };
+
+      onSaveAsset(asset);
+      setSavedSuccess(true);
+      setTimeout(() => setSavedSuccess(false), 2500);
+
+      // Switch to library tab to show the new asset
+      setActiveTab('library');
+
+    } catch (err) {
+      console.error('Erro ao importar imagem:', err);
+      alert('Falha ao processar imagem. Verifique o console para detalhes.');
+    }
+  };
+
   // ---------------------------------------------------------------------------
   // DRAW EDITOR CANVAS
   // ---------------------------------------------------------------------------
@@ -3329,7 +3597,7 @@ export const AssetStudioView: React.FC<AssetStudioViewProps> = ({
       {/* ===================================================================== */}
       {activeTab === 'library' && (
         <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 space-y-4">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between flex-wrap gap-3">
             <div>
               <h3 className="text-base font-mono font-bold text-white flex items-center gap-2">
                 <FolderOpen className="w-5 h-5 text-indigo-400" />
@@ -3338,6 +3606,26 @@ export const AssetStudioView: React.FC<AssetStudioViewProps> = ({
               <p className="text-xs text-slate-400 font-mono mt-1">
                 Seus projetos salvos com hashes criptografados e configurações multi-ângulo.
               </p>
+            </div>
+
+            {/* Botão Importar Imagem */}
+            <div className="flex items-center gap-2">
+              <label className="cursor-pointer group">
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="sr-only"
+                  onChange={handleImportImage}
+                  title="Importar imagem (JPEG/PNG) → CustomCarAsset"
+                />
+                <button
+                  type="button"
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-mono font-bold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/40 cursor-pointer transition-all group-hover:border-emerald-500"
+                >
+                  <Upload className="w-4 h-4" />
+                  <span>Importar Imagem</span>
+                </button>
+              </label>
             </div>
           </div>
 
